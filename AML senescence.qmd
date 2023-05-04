@@ -1,0 +1,32 @@
+---
+title: "AML senescence"
+author: "Sebastian Wolf"
+toc: true
+format:
+  html:
+    theme: litera
+    self-contained: true
+    code-fold: true
+knitr:
+  opts_chunk:
+    message: false
+    warning: false
+bibliography: references.bib
+---
+
+## 
+
+# Introduction
+
+Schönlein, Schmitt et al. identify and characterize a therapy-induced senescence (TIS) signature in AML and characterize its phenotype between a beneficial barrier to cancer progression which results in favorable clinical outcome on the one and an unfavorable pro-inflammatory senescence-associated secretory phenotype (SASP) on the other side. Using the inferred gene signature based on significantly upregulated genes found in senescent AML blasts after therapy, they performed unsupervised clustering and identified 5 subgroups of which one, (cluster 3) was enriched for AML M3.
+
+Using our cohort in detail described in [@jayavelu2022] including 177 bone marrow samples from newly diagnosed AML patients treated with intensive induction therapy we will try to validate findings outlined above. However, our cohort does **not** include AML M3 cases. A detailed description on the data generation and preprocessing in addition to the papers methods section can be found [here](https://github.com/swolfsci/AML_proteogenomics/blob/main/LFQ%20Proteomics%20Workflow/20221413_lfq_proteome_preprocess_merge_impute.md) and [here](https://github.com/swolfsci/AML_proteogenomics/blob/main/RNA%20Seq%20Workflow/20220323_bulk_RNASeq_normalization_and_transformation.md).
+
+Furthermore, since we have proteomic and gene expression data for the majority of patients, we can characterize the relationship between the two layers with respect to the TIS-signature.
+
+# Dataset preparation and carpentry
+
+```{r}
+library(tidyverse)
+library(MultiAssayExperiment)
+```
