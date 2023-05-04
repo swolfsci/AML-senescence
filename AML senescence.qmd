@@ -24,9 +24,400 @@ Using our cohort in detail described in [@jayavelu2022] including 177 bone marro
 
 Furthermore, since we have proteomic and gene expression data for the majority of patients, we can characterize the relationship between the two layers with respect to the TIS-signature.
 
-# Dataset preparation and carpentry
+# Results
+
+## Data set preparation and carpentry
 
 ```{r}
 library(tidyverse)
 library(MultiAssayExperiment)
+library(ConsensusClusterPlus)
+
+prot_aml <- readRDS("~/Forschung/AG Oellerich/Datensätze/FFM_Discovery_Cohort/FFM_Proteomics/prot_ffm.multiassayexperiment.RDS")
+clindat <- read_csv("~/Forschung/AG Oellerich/Datensätze/FFM_Discovery_Cohort/FFM_AML_Discovery_Cohort.csv")
+rna_aml <- readRDS("~/Forschung/AG Oellerich/Datensätze/FFM_Discovery_Cohort/FFM_RNASeq/FFM_Discovery_Cohort_RNASeq_vst.RDS")
+
+tis_signature <- read_tsv("tis_signature.txt", col_names = "gene")
+```
+
+Build a mapping vector for the RNASeq ensembl IDs
+
+```{r}
+mart <- biomaRt::useEnsembl(biomart = "genes", dataset = "hsapiens_gene_ensembl", mirror = "www")
+
+id_mapping <- biomaRt::getBM(values = rownames(rna_aml), attributes = c("ensembl_gene_id", "uniprotswissprot", "hgnc_symbol"), mart = mart, filters = c("ensembl_gene_id"), verbose = T)
+
+id_mapping %>% 
+  mutate(hasuniprot = uniprotswissprot != "") %>% 
+  group_by(ensembl_gene_id) %>% 
+  arrange(desc(hasuniprot), .by_group = T) %>% 
+  slice_head(n = 1) -> id_mapping
+
+
+```
+
+Map the TIS signature to ensembl ID
+
+```{r}
+# identify not matched proteins
+tis_signature[!tis_signature$gene %in% id_mapping$hgnc_symbol,]
+# MARCH4 actually maps to MARCHF4
+tis_signature[tis_signature$gene == "MARCH4",]$gene <- "MARCHF4"
+tis_signature <- filter(tis_signature, gene != "RP3-509I19.1")
+```
+
+Since we mapped RNASeq to coding regions only, lncRNA RP3-509I19.1 is not mapped in the data set
+
+```{r}
+rna_aml.tis <- rna_aml[id_mapping[match(tis_signature$gene, id_mapping$hgnc_symbol),]$ensembl_gene_id, ]
+```
+
+We evaluate how many of the genes are covered in the proteome.
+
+```{r}
+
+id_mapping[match(tis_signature$gene, id_mapping$hgnc_symbol), ]$uniprotswissprot %in% rownames(assay(prot_aml, "proteomics_unimputed")) %>% sum()
+```
+
+Unfortunately, only 5 of the 90 genes are covered in the proteome which makes it not very suitable for the initial clustering.
+
+## Clustering
+
+Schönlein et al. used unsupervised hierachical clustering for the identification of 5 groups. The exact parametrization is not known. We use a similar approach within the consensus cluster framework [@monti2003] to compare different values of *k.*
+
+To first get in idea of the different compositions we generate a out of the box hc with *k*=5 using euclidean distance and complete and Wards linkage.
+
+```{r}
+hclust(d = dist(t(rna_aml.tis), method = "euclidean"), method = "ward.D2") %>% 
+  cutree(k = 5) -> ward_sol
+
+hclust(d = dist(t(rna_aml.tis), method = "euclidean"), method = "complete") %>% 
+  cutree(k = 5) -> complete_sol
+
+ward_sol %>% 
+  as.data.frame() %>% 
+  bind_cols(complete_sol) %>% 
+  {
+    table(.$`.`, .$`...2`)
+  }
+```
+
+Except for clusters 2 and 3 there is quite good concordance between the Wards and complete linkage.
+
+```{r}
+cluster::silhouette(complete_sol, dist(t(rna_aml.tis), method = "euclidean")) -> complete_sil
+cluster::silhouette(ward_sol, dist(t(rna_aml.tis), method = "euclidean")) -> ward_sil
+
+summary(complete_sil)
+summary(ward_sil)
+```
+
+While both solutions have moderate silhouette scores for *k* = 5, complete linkage is slightly better. Thus we'll use this to test different values for *k*. However, we will also try out [PAM](https://en.wikipedia.org/wiki/K-medoids) and [k-means](https://en.wikipedia.org/wiki/K-means_clustering)
+
+```{r}
+#| output: false
+ConsensusClusterPlus::ConsensusClusterPlus(d = rna_aml.tis, maxK = 6, clusterAlg = "hc", distance = "euclidean", seed = 069, verbose = T, innerLinkage = "complete") -> cc_out.hc
+ConsensusClusterPlus::ConsensusClusterPlus(d = rna_aml.tis, maxK = 6, clusterAlg = "pam", distance = "euclidean", seed = 069, verbose = T, innerLinkage = "complete") -> cc_out.pam
+ConsensusClusterPlus::ConsensusClusterPlus(d = rna_aml.tis, maxK = 6, clusterAlg = "km", distance = "euclidean", seed = 069, verbose = T, innerLinkage = "complete") -> cc_out.kmeans
+
+```
+
+```{r}
+#| output: false
+ConsensusClusterPlus::calcICL(cc_out.hc) -> cc_out.icl.hc
+ConsensusClusterPlus::calcICL(cc_out.pam) -> cc_out.icl.pam
+ConsensusClusterPlus::calcICL(cc_out.kmeans) -> cc_out.icl.kmeans
+
+```
+
+The clustering solution suggest *k* = 3 for hc because any *k* greater than this only separates single (presumably outlier) samples from the cohort. Already with k = 3 there is large heterogeneity within the the largest cluster. For pam *k* = 4 and for kmeans *k* = 5 look good.
+
+```{r}
+hc_k3 = cc_out.hc[[3]]$consensusClass %>% as_tibble(rownames = "MPI") %>% dplyr::rename("hc_k3" = "value")
+hc_k5 = complete_sol %>% as_tibble(rownames = "MPI") %>% dplyr::rename("hc_k5" = "value")
+pam_k4 = cc_out.pam[[4]]$consensusClass %>% as_tibble(rownames = "MPI") %>% dplyr::rename("pam_k4" = "value")
+kmeans_k5 = cc_out.kmeans[[5]]$consensusClass %>% as_tibble(rownames = "MPI") %>% dplyr::rename("kmeans_k5" = "value")
+
+hc_k3 %>% 
+  left_join(hc_k5) %>% 
+  left_join(pam_k4) %>% 
+  left_join(kmeans_k5) -> cluster_out
+```
+
+### Expression heatmaps
+
+We can plot the cluster-wise, median-aggregated expression of the TIS signature after feature-wise scaling (to correct for the different absolute expression levels of genes (i.e. on average higher expressed genes vs on average lower expressed genes)).
+
+```{r}
+rna_aml.tis %>% 
+  t() %>% 
+  scale() %>% 
+  t() %>% 
+  as_tibble(rownames = "gene") %>% 
+  mutate(gene = deframe(dplyr::select(id_mapping, ensembl_gene_id, hgnc_symbol))[gene]) %>% 
+  pivot_longer(cols = -gene, values_to = "expression", names_to = "id") %>% 
+  left_join(cluster_out, by=c("id" = "MPI")) %>% 
+  pivot_longer(cols = c(hc_k3:kmeans_k5), names_to = "clus", values_to = "value") %>% 
+  {
+    split(., .$clus)
+  } %>% 
+  map(~ group_by(., gene, value) %>% 
+        summarize(expression = median(expression)) %>% 
+        pivot_wider(id_cols = gene, values_from = expression, names_from = value, names_prefix = "clus_") %>% 
+        column_to_rownames("gene") %>% 
+        as.matrix()) -> median_expression_mats
+```
+
+### HC k = 3 expression heatmap
+
+```{r}
+#| fig-width: 5
+#| fig-height: 12
+ComplexHeatmap::Heatmap(median_expression_mats[[1]], cluster_columns = F)
+```
+
+### HC k = 5 expression heatmap
+
+```{r}
+#| fig-width: 5
+#| fig-height: 12
+ComplexHeatmap::Heatmap(median_expression_mats[[2]], cluster_columns = F)
+```
+
+### PAM k = 4 expression heatmap
+
+```{r}
+#| fig-width: 5
+#| fig-height: 12
+ComplexHeatmap::Heatmap(median_expression_mats[[3]], cluster_columns = F)
+```
+
+### k-means k = 5 expression heatmap
+
+```{r}
+#| fig-width: 5
+#| fig-height: 12
+ComplexHeatmap::Heatmap(median_expression_mats[[4]], cluster_columns = F)
+```
+
+## Clinical evaluation
+
+We plot the prognostic value for the "optimal" *k* = 3 clustering and also the *k* = 5 solution from hc.
+
+```{r}
+clindat %>% 
+  left_join(mutate(cluster_out, MPI = as.numeric(MPI)), by = "MPI") -> clindat
+```
+
+```{r}
+library(survival)
+library(survminer)
+library(patchwork)
+```
+
+```{r}
+survdiff(Surv(OSM, OS_Status) ~ hc_k3, clindat)
+survdiff(Surv(OSM, OS_Status) ~ hc_k5, clindat)
+survdiff(Surv(OSM, OS_Status) ~ pam_k4, clindat)
+survdiff(Surv(OSM, OS_Status) ~ kmeans_k5, clindat)
+```
+
+While the hc solutions don't have any clinical phenotype, the k = 4 PAM solution does separate some significantly different survival curves.
+
+```{r}
+#| fig-width: 10
+#| fig-height: 8
+survfit(Surv(OSM, OS_Status) ~ pam_k4, data = clindat) %>% 
+  ggsurvplot(palette = "nejm", risk.table = T, pval = T, titel = "Overall Survival", ylab = "OS probability") -> p_pam
+
+survfit(Surv(EFSM, EFS_Status) ~ pam_k4, data = clindat) %>% 
+  ggsurvplot(palette = "nejm", risk.table = T, pval = T, titel = "Event free Survival", ylab = "EFS probability") -> p_pam_efs
+
+survfit(Surv(RFSM, RFS_Event) ~ pam_k4, data = clindat) %>% 
+  ggsurvplot(palette = "nejm", risk.table = T, pval = T, titel = "Relapse free Survival", ylab = "RFS probability") -> p_pam_rfs
+
+
+cowplot::plot_grid(plotlist = list(p_pam$plot + theme(legend.position = "none"), p_pam_efs$plot + theme(legend.position = "none"), p_pam_rfs$plot + theme(legend.position = "none"))) -> inner_grid
+
+cowplot::plot_grid(plotlist = list(inner_grid, cowplot::get_legend(p_pam$plot)), nrow = 2, rel_heights = c(0.95, 0.05))
+```
+
+Clearly, cluster 1 has a significantly poorer overall survival. We first test the correlation with known clinical covariates.
+
+```{r}
+vars <- c("Sex", "Age_group", "ELN2017", "FAB", "Precursor_fac", "WHO")
+tableone::CreateTableOne(vars = vars, strata = "pam_k4", data = clindat, factorVars = "WHO") %>% 
+  tableone::kableone()
+```
+
+Cluster 1 is highly biased towards adverse risk and secondary AML and AML-MRC (per WHO 2016). We confirm this correlation by comparing the univariate against the multivariate model for OS including cytogenetics and precursor status.
+
+```{r}
+coxph(Surv(OSM, OS_Status) ~ pam_k4, clindat)
+```
+
+```{r}
+coxph(Surv(OSM, OS_Status) ~ pam_k4 + ELN2017, clindat)
+```
+
+## Cluster characterization
+
+Similarly to what Schönlein et al. did with their 5 clusters, we can identify differentially expressed genes per cluster to get an idea of the underlying biology and compare them to the TIS profiles they gave their clusters. For each cluster, we use a simple one vs all linear model approach to identify differentially expressed proteins with a FDR \<5%.
+
+```{r}
+
+de_prot <- function(clus) {
+  mm <- model.matrix(~ 0 + factor(pam_k4 == clus), data = filter(clindat, MPI %in% colnames(rna_aml)))
+  colnames(mm) <- c("inclus", "notinclus")
+  cm <- limma::makeContrasts(inclus - notinclus, levels = mm)
+  rna_aml %>% 
+    limma::lmFit(mm) %>% 
+    limma::contrasts.fit(cm) %>% 
+    limma::eBayes() %>% 
+    limma::topTable(p.value = 0.01, number = Inf) %>% 
+    as_tibble(rownames = "gene")
+}
+
+sapply(c(1:4), FUN = de_prot, simplify = F, USE.NAMES = T) -> de_prots_list
+
+map(de_prots_list, ~ mutate(., symbol = deframe(dplyr::select(id_mapping, ensembl_gene_id, hgnc_symbol))[gene]) %>% 
+      arrange(desc(logFC))) -> de_prots_list
+```
+
+### PAM cluster 1
+
+DE proteins
+
+```{r}
+de_prots_list[[1]] %>% 
+  relocate(symbol, .after = gene) %>% 
+  DT::datatable(filter = "top", options = list(autoWidth = F, scrollX = T), class = "compact hover row-border stripe dt-left cell-border nowrap")
+```
+
+Volcano
+
+```{r}
+de_prots_list[[1]] %>% 
+  ggplot(aes(x=logFC, y = -log(adj.P.Val), label = symbol)) +
+  geom_point() +
+  cowplot::theme_minimal_grid() +
+  cowplot::panel_border() +
+  ggrepel::geom_text_repel() +
+  labs(caption = "positive logFC = higher expressed in cluster")
+```
+
+Interactive volcano
+
+```{r}
+de_prots_list[[1]] %>% 
+  ggplot(aes(x=logFC, y = -log(adj.P.Val), label = symbol)) +
+  geom_point() +
+  cowplot::theme_minimal_grid() +
+  cowplot::panel_border() +
+  labs(caption = "positive logFC = higher expressed in cluster") -> p_clus1
+
+plotly::ggplotly(p_clus1)
+```
+
+### PAM cluster 2
+
+DE proteins
+
+```{r}
+de_prots_list[[2]] %>% 
+  relocate(symbol, .after = gene) %>% 
+  DT::datatable(filter = "top", options = list(autoWidth = F, scrollX = T), class = "compact hover row-border stripe dt-left cell-border nowrap")
+```
+
+Volcano
+
+```{r}
+de_prots_list[[2]] %>% 
+  ggplot(aes(x=logFC, y = -log(adj.P.Val), label = symbol)) +
+  geom_point() +
+  cowplot::theme_minimal_grid() +
+  cowplot::panel_border() +
+  ggrepel::geom_text_repel() +
+  labs(caption = "positive logFC = higher expressed in cluster")
+```
+
+Interactive volcano
+
+```{r}
+de_prots_list[[2]] %>% 
+  ggplot(aes(x=logFC, y = -log(adj.P.Val), label = symbol)) +
+  geom_point() +
+  cowplot::theme_minimal_grid() +
+  cowplot::panel_border() +
+  labs(caption = "positive logFC = higher expressed in cluster") -> p_clus2
+
+plotly::ggplotly(p_clus2)
+```
+
+### PAM cluster 3
+
+DE proteins
+
+```{r}
+de_prots_list[[3]] %>% 
+  relocate(symbol, .after = gene) %>% 
+  DT::datatable(filter = "top", options = list(autoWidth = F, scrollX = T), class = "compact hover row-border stripe dt-left cell-border nowrap")
+```
+
+Volcano
+
+```{r}
+de_prots_list[[3]] %>% 
+  ggplot(aes(x=logFC, y = -log(adj.P.Val), label = symbol)) +
+  geom_point() +
+  cowplot::theme_minimal_grid() +
+  cowplot::panel_border() +
+  ggrepel::geom_text_repel() +
+  labs(caption = "positive logFC = higher expressed in cluster")
+```
+
+Interactive volcano
+
+```{r}
+de_prots_list[[3]] %>% 
+  ggplot(aes(x=logFC, y = -log(adj.P.Val), label = symbol)) +
+  geom_point() +
+  cowplot::theme_minimal_grid() +
+  cowplot::panel_border() +
+  labs(caption = "positive logFC = higher expressed in cluster") -> p_clus3
+
+plotly::ggplotly(p_clus3)
+```
+
+### PAM cluster 4
+
+```{r}
+de_prots_list[[4]] %>% 
+  relocate(symbol, .after = gene) %>% 
+  DT::datatable(filter = "top", options = list(autoWidth = F, scrollX = T), class = "compact hover row-border stripe dt-left cell-border nowrap")
+```
+
+Volcano
+
+```{r}
+de_prots_list[[4]] %>% 
+  ggplot(aes(x=logFC, y = -log(adj.P.Val), label = symbol)) +
+  geom_point() +
+  cowplot::theme_minimal_grid() +
+  cowplot::panel_border() +
+  ggrepel::geom_text_repel() +
+  labs(caption = "positive logFC = higher expressed in cluster")
+```
+
+Interactive volcano
+
+```{r}
+de_prots_list[[4]] %>% 
+  ggplot(aes(x=logFC, y = -log(adj.P.Val), label = symbol)) +
+  geom_point() +
+  cowplot::theme_minimal_grid() +
+  cowplot::panel_border() +
+  labs(caption = "positive logFC = higher expressed in cluster") -> p_clus4
+
+plotly::ggplotly(p_clus4)
 ```
